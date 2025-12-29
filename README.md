@@ -1,0 +1,1 @@
+# squadprops-frontend
