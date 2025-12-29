@@ -1,65 +1,206 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import styles from "./page.module.css";
+import { fetchCallReadOnlyFunction, cvToJSON, uintCV, principalCV } from "@stacks/transactions";
+import { STACKS_MAINNET } from "@stacks/network";
+import { CONTRACT_ADDRESS, CONTRACT_NAME, userSession } from "@/config";
 
 type TabType = "all" | "received" | "given";
 
-const historyData = [
-  {
-    type: "received",
-    from: "SP2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKNRV9EJ7",
-    to: "SP1WEKNK5SGNTYM0J8M34FMBM7PTRJSYRWY9C1CGR",
-    amount: 5,
-    message: "Excellent work on the smart contract deployment! 🚀",
-    date: "2 hours ago",
-    blockHeight: 123456,
-  },
-  {
-    type: "given",
-    from: "SP1WEKNK5SGNTYM0J8M34FMBM7PTRJSYRWY9C1CGR",
-    to: "SP3FBR2AGK5H9QBDH3EEN6DF8EK8JY7RX8QJ5SVTE",
-    amount: 3,
-    message: "Thanks for the code review and helpful feedback!",
-    date: "5 hours ago",
-    blockHeight: 123450,
-  },
-  {
-    type: "received",
-    from: "SPAXYA5XS51713FDTQ8H94EJ4V579CXMTRNBZKSF",
-    to: "SP1WEKNK5SGNTYM0J8M34FMBM7PTRJSYRWY9C1CGR",
-    amount: 2,
-    message: "Great documentation updates! 📚",
-    date: "1 day ago",
-    blockHeight: 123400,
-  },
-  {
-    type: "given",
-    from: "SP1WEKNK5SGNTYM0J8M34FMBM7PTRJSYRWY9C1CGR",
-    to: "SP2KAF9RF86PVX3NEE27DFV1CQX0T4WGR41X3S45C",
-    amount: 1,
-    message: "Appreciate the help with debugging!",
-    date: "2 days ago",
-    blockHeight: 123350,
-  },
-  {
-    type: "received",
-    from: "SP3D6PV2ACBPEKYJTCMH7HEN02KP87QSP8KTEH335",
-    to: "SP1WEKNK5SGNTYM0J8M34FMBM7PTRJSYRWY9C1CGR",
-    amount: 4,
-    message: "Amazing presentation at the meetup! 🎤",
-    date: "3 days ago",
-    blockHeight: 123300,
-  },
-];
+interface HistoryItem {
+  id: number;
+  type: "received" | "given";
+  from: string;
+  to: string;
+  amount: number;
+  message: string;
+  blockHeight: number;
+  // We can't easily get the date without block time conversion, so we'll use block height
+}
 
 export default function HistoryPage() {
   const [activeTab, setActiveTab] = useState<TabType>("all");
+  const [historyItems, setHistoryItems] = useState<HistoryItem[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isSignedIn, setIsSignedIn] = useState(false);
+  const [userAddress, setUserAddress] = useState<string>('');
 
-  const filteredHistory = historyData.filter((item) => {
-    if (activeTab === "all") return true;
-    return item.type === activeTab;
-  });
+  useEffect(() => {
+    if (userSession && userSession.isUserSignedIn()) {
+      setIsSignedIn(true);
+      const userData = userSession.loadUserData();
+      const address = userData.profile?.stxAddress?.mainnet || '';
+      setUserAddress(address);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (userAddress) {
+      loadHistory();
+    }
+  }, [userAddress, activeTab]);
+
+  // Helper for delayed fetch with retries (reused from Leaderboard)
+  const robustFetch = async (fn: () => Promise<any>, retries = 3, delayMs = 500) => {
+    for (let i = 0; i < retries; i++) {
+      try {
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+        return await fn();
+      } catch (error) {
+        if (i === retries - 1) throw error;
+        await new Promise(resolve => setTimeout(resolve, delayMs * Math.pow(2, i)));
+      }
+    }
+  };
+
+  const loadHistory = async () => {
+    setIsLoading(true);
+    setHistoryItems([]);
+
+    try {
+      const network = { ...STACKS_MAINNET, fetchFn: fetch };
+      
+      // Strategy:
+      // 1. "Received" -> fetch user's history list
+      // 2. "Given" / "All" -> scan recent global props (limited to 50)
+      
+      const items: HistoryItem[] = [];
+
+      if (activeTab === "received") {
+        const historyResult = await robustFetch(() => fetchCallReadOnlyFunction({
+          contractAddress: CONTRACT_ADDRESS,
+          contractName: CONTRACT_NAME,
+          functionName: "get-user-history",
+          functionArgs: [principalCV(userAddress)],
+          network,
+          senderAddress: userAddress,
+        }));
+
+        const historyJSON = cvToJSON(historyResult);
+        const historyIds = historyJSON.value?.value || [];
+        
+        // Fetch details for each ID (last 20 to avoid overload)
+        const recentIds = historyIds.slice(-20).reverse();
+
+        for (const idWrapper of recentIds) {
+          try {
+            const id = parseInt(idWrapper.value);
+            const propsResult = await robustFetch(() => fetchCallReadOnlyFunction({
+              contractAddress: CONTRACT_ADDRESS,
+              contractName: CONTRACT_NAME,
+              functionName: "get-props-by-id",
+              functionArgs: [uintCV(id)],
+              network,
+              senderAddress: userAddress,
+            }));
+
+            const propsJSON = cvToJSON(propsResult);
+            const propData = propsJSON.value?.value?.value || propsJSON.value?.value;
+
+            if (propData) {
+              items.push({
+                id,
+                type: "received",
+                from: propData.giver.value,
+                to: propData.receiver.value,
+                amount: parseInt(propData.amount.value),
+                message: propData.message.value,
+                blockHeight: parseInt(propData.timestamp.value), // Using timestamp as block height
+              });
+            }
+          } catch (e) {
+            console.error("Error fetching prop details:", e);
+          }
+        }
+      } else {
+        // For "Given" or "All", we scan recent global props
+        // Get current props ID
+        const counterResult = await robustFetch(() => fetchCallReadOnlyFunction({
+          contractAddress: CONTRACT_ADDRESS,
+          contractName: CONTRACT_NAME,
+          functionName: "get-current-props-id",
+          functionArgs: [],
+          network,
+          senderAddress: userAddress,
+        }));
+
+        const counterJSON = cvToJSON(counterResult);
+        const totalProps = counterJSON.value ? parseInt(counterJSON.value.value) : 0;
+        
+        // Scan last 50 props
+        const limit = Math.min(50, totalProps);
+        const startIndex = Math.max(0, totalProps - limit);
+
+        for (let i = totalProps - 1; i >= startIndex; i--) {
+          try {
+            const propsResult = await robustFetch(() => fetchCallReadOnlyFunction({
+              contractAddress: CONTRACT_ADDRESS,
+              contractName: CONTRACT_NAME,
+              functionName: "get-props-by-id",
+              functionArgs: [uintCV(i)],
+              network,
+              senderAddress: userAddress,
+            }));
+
+            const propsJSON = cvToJSON(propsResult);
+            const propData = propsJSON.value?.value?.value || propsJSON.value?.value;
+
+            if (propData) {
+              const giver = propData.giver.value;
+              const receiver = propData.receiver.value;
+              
+              const isGiver = giver === userAddress;
+              const isReceiver = receiver === userAddress;
+
+              if (activeTab === "given" && isGiver) {
+                items.push({
+                  id: i,
+                  type: "given",
+                  from: giver,
+                  to: receiver,
+                  amount: parseInt(propData.amount.value),
+                  message: propData.message.value,
+                  blockHeight: parseInt(propData.timestamp.value),
+                });
+              } else if (activeTab === "all" && (isGiver || isReceiver)) {
+                items.push({
+                  id: i,
+                  type: isReceiver ? "received" : "given",
+                  from: giver,
+                  to: receiver,
+                  amount: parseInt(propData.amount.value),
+                  message: propData.message.value,
+                  blockHeight: parseInt(propData.timestamp.value),
+                });
+              }
+            }
+          } catch (e) {
+             console.error(`Error scanning prop ${i}:`, e);
+          }
+        }
+      }
+
+      setHistoryItems(items);
+    } catch (error) {
+      console.error("Error loading history:", error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  if (!isSignedIn) {
+    return (
+      <div className={styles.page}>
+        <div className={styles.container}>
+          <div className={styles.header}>
+            <h1 className={styles.title}>📜 Props History</h1>
+            <p className={styles.subtitle}>Please connect your wallet to view your history</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className={styles.page}>
@@ -92,15 +233,19 @@ export default function HistoryPage() {
           </button>
         </div>
 
-        {filteredHistory.length > 0 ? (
+        {isLoading ? (
+          <div className={styles.emptyState}>
+            <p>Loading blockchain history...</p>
+          </div>
+        ) : historyItems.length > 0 ? (
           <div className={styles.timeline}>
-            {filteredHistory.map((item, index) => (
-              <div key={index} className={styles.timelineItem}>
+            {historyItems.map((item) => (
+              <div key={item.id} className={styles.timelineItem}>
                 <div className={styles.itemHeader}>
                   <span className={styles.itemType}>
                     {item.type === "received" ? "📥 Received" : "📤 Given"}
                   </span>
-                  <span className={styles.itemDate}>{item.date}</span>
+                  <span className={styles.itemDate}>Block #{item.blockHeight}</span>
                 </div>
 
                 <div className={styles.itemContent}>
@@ -121,8 +266,6 @@ export default function HistoryPage() {
                   <span className={styles.propsAmount}>
                     {item.amount} prop{item.amount > 1 ? "s" : ""}
                   </span>
-                  <span>•</span>
-                  <span>Block #{item.blockHeight}</span>
                 </div>
               </div>
             ))}
@@ -130,7 +273,7 @@ export default function HistoryPage() {
         ) : (
           <div className={styles.emptyState}>
             <div className={styles.emptyIcon}>📭</div>
-            <p>No {activeTab !== "all" ? activeTab : ""} props history yet</p>
+            <p>No {activeTab !== "all" ? activeTab : ""} props history found in recent blocks</p>
           </div>
         )}
       </div>
